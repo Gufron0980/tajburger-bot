@@ -59,18 +59,32 @@ def get_si_report():
         if not audits:
             return "📋 <b>Service Inspector:</b> Проверок за сегодня нет"
 
+        # Группируем по шаблону + объект (убираем дубликаты, берём лучший результат)
+        grouped = {}
+        for a in audits:
+            key = (a.get("name", ""), a.get("selectedInspectObjectName", ""))
+            existing = grouped.get(key)
+            if not existing or a.get("result", 0) > existing.get("result", 0):
+                grouped[key] = a
+
         report = "📋 <b>KPI — Service Inspector</b>\n"
+        report += f"📅 {datetime.now().strftime('%d.%m.%Y')}\n"
         report += "━━━━━━━━━━━━━━━━\n"
-        for a in audits[:10]:
+        
+        total = len(grouped)
+        avg = sum(a.get("result", 0) for a in grouped.values()) / total if total else 0
+        
+        for (name, obj), a in sorted(grouped.items()):
             result = a.get("result", 0)
-            name = a.get("name", "—")
-            obj = a.get("selectedInspectObjectName", "—")
             inspector = a.get("inspectorName", "—")
             closed = "✅" if a.get("isClosed") else "🔄"
             emoji = "🟢" if result >= 80 else ("🟡" if result >= 60 else "🔴")
             report += f"{closed} {emoji} <b>{name}</b>\n"
             report += f"   📍 {obj} | 👤 {inspector}\n"
             report += f"   📊 Результат: {result:.1f}%\n\n"
+        
+        report += f"━━━━━━━━━━━━━━━━\n"
+        report += f"📊 Проверок: {total} | Средний балл: {avg:.1f}%"
         return report
     except Exception as e:
         return f"❌ Ошибка SI: {str(e)}"
