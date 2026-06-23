@@ -115,48 +115,46 @@ def get_syrve_report(date=None):
 
     try:
         metrics = {}
-        rows = data.get("rows", [])
+        rows = data.get("rows", []) if isinstance(data, dict) else []
         for row in rows:
+            if not isinstance(row, dict):
+                continue
             for cell in row.get("cells", []):
+                if not isinstance(cell, dict):
+                    continue
                 wd = cell.get("widgetData", {})
-
-                # Вариант 1: metrics[]
-                for m in wd.get("metrics", []):
-                    code = m.get("metricCode", "")
-                    val  = m.get("currentPeriodValue") or m.get("value")
-                    if code and val is not None:
-                        metrics[code] = val
-
-                # Вариант 2: tiles[]
-                for tile in wd.get("tiles", []):
+                if not isinstance(wd, dict):
+                    continue
+                for tile in (wd.get("tiles") or []):
+                    if not isinstance(tile, dict):
+                        continue
                     code = tile.get("metricCode", "")
-                    val  = tile.get("currentPeriodValue") or tile.get("value")
+                    val = tile.get("currentPeriodValue") or tile.get("value")
                     if code and val is not None:
                         metrics[code] = val
+                for m in (wd.get("metrics") or []):
+                    if not isinstance(m, dict):
+                        continue
+                    code = m.get("metricCode", "")
+                    val = m.get("currentPeriodValue") or m.get("value")
+                    if code and val is not None:
+                        metrics[code] = val
+                for s in (wd.get("series") or []):
+                    if not isinstance(s, dict):
+                        continue
+                    code = s.get("metricCode", "")
+                    vals = s.get("data") or []
+                    if code and vals:
+                        total = sum(v for v in vals if isinstance(v, (int, float)))
+                        if total:
+                            metrics.setdefault(code, total)
 
-                # Вариант 3: series[] + x[] (график)
-                series_list = wd.get("series", [])
-                x_list      = wd.get("x", [])
-                y_list      = wd.get("y", [])
-                if series_list and x_list:
-                    for s in series_list:
-                        code = s.get("metricCode", "")
-                        vals = s.get("data", [])
-                        if code and vals:
-                            metrics[code] = sum(v for v in vals if v is not None)
+        rev    = metrics.get("REV_NET") or metrics.get("NET_REVENUE") or metrics.get("REVENUE")
+        orders = metrics.get("ORDERS_COUNT") or metrics.get("CHECKS_COUNT")
+        avg    = metrics.get("AVG_CHECK") or metrics.get("AVG_REVENUE")
+        guests = metrics.get("GUESTS_COUNT")
 
-                # Вариант 4: прямые поля
-                for key in ["REV_NET", "REV_FORECASTED", "ORDERS_COUNT", "AVG_CHECK", "GUESTS_COUNT"]:
-                    if key in wd:
-                        metrics[key] = wd[key]
-
-        # Формируем отчёт
-        if metrics:
-            rev = metrics.get("REV_NET", metrics.get("NET_REVENUE", metrics.get("REVENUE")))
-            orders = metrics.get("ORDERS_COUNT", metrics.get("CHECKS_COUNT"))
-            avg = metrics.get("AVG_CHECK", metrics.get("AVG_REVENUE"))
-            guests = metrics.get("GUESTS_COUNT")
-
+        if any(v is not None for v in [rev, orders, avg, guests]):
             if rev is not None:
                 report += f"💰 <b>Выручка:</b> {float(rev):.2f} AED\n"
             if orders is not None:
@@ -165,16 +163,11 @@ def get_syrve_report(date=None):
                 report += f"📈 <b>Средний чек:</b> {float(avg):.2f} AED\n"
             if guests is not None:
                 report += f"👥 <b>Гостей:</b> {int(float(guests))}\n"
-
-            if not any([rev, orders, avg, guests]):
-                report += f"<i>Метрики получены: {list(metrics.keys())}</i>\n"
         else:
             report += f"<i>Данные за {today} ещё не поступили</i>\n"
-            # Логируем сырые данные для отладки
-            logging.info(f"Syrve raw data keys: {list(data.keys())}")
-            if rows:
-                first_cell = rows[0].get("cells", [{}])[0]
-                logging.info(f"First cell widgetData keys: {list(first_cell.get('widgetData', {}).keys())}")
+            if metrics:
+                report += f"<i>Метрики: {', '.join(list(metrics.keys())[:5])}</i>\n"
+            logging.info(f"Syrve metrics: {metrics}")
 
     except Exception as e:
         logging.error(f"Syrve parse error: {e}")
