@@ -12,6 +12,8 @@ BITRIX_WEBHOOK = os.environ.get("BITRIX_WEBHOOK")
 OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID", "7674074787")
 SI_LOGIN = os.environ.get("SI_LOGIN")
 SI_PASSWORD = os.environ.get("SI_PASSWORD")
+SYRVE_URL = os.environ.get("SYRVE_URL", "https://puzzle-restaurant.syrve.app")
+SYRVE_API_KEY = os.environ.get("SYRVE_API_KEY")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SI_API = "https://server.serviceinspector.ru/api/0"
@@ -32,6 +34,137 @@ def send_message(chat_id, text, parse_mode="HTML"):
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         logging.error(f"Send message error: {e}")
+
+# ─────────────────────────────────────────────
+# SYRVE
+# ─────────────────────────────────────────────
+
+def syrve_get_token():
+    try:
+        r = requests.post(
+            f"{SYRVE_URL}/api/1/access_token",
+            json={"apiLogin": SYRVE_API_KEY},
+            timeout=10
+        )
+        data = r.json()
+        token = data.get("token")
+        if not token:
+            logging.error(f"Syrve token error: {data}")
+        return token
+    except Exception as e:
+        logging.error(f"Syrve auth error: {e}")
+        return None
+
+def syrve_get_org_id(token):
+    try:
+        r = requests.post(
+            f"{SYRVE_URL}/api/1/organizations",
+            json={"returnAdditionalInfo": False},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10
+        )
+        orgs = r.json().get("organizations", [])
+        return orgs[0]["id"] if orgs else None
+    except Exception as e:
+        logging.error(f"Syrve org error: {e}")
+        return None
+
+def get_syrve_report(date=None):
+    if not SYRVE_API_KEY:
+        return "❌ Syrve: API ключ не настроен"
+
+    token = syrve_get_token()
+    if not token:
+        return "❌ Syrve: не удалось получить токен"
+
+    org_id = syrve_get_org_id(token)
+    if not org_id:
+        return "❌ Syrve: не удалось получить ID организации"
+
+    today = date or datetime.now().strftime("%Y-%m-%d")
+    date_from = f"{today} 00:00:00"
+    date_to   = f"{today} 23:59:59"
+    headers   = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # — Продажи (OLAP) —
+    total_revenue = 0
+    total_orders  = 0
+    dishes = []
+    try:
+        r = requests.post(
+            f"{SYRVE_URL}/api/1/reports/olap",
+            json={
+                "organizationId": org_id,
+                "settings": {
+                    "queryFilter": {
+                        "dateFrom": date_from,
+                        "dateTo":   date_to,
+                        "openDateFrom": date_from,
+                        "openDateTo":   date_to
+                    },
+                    "groupByRowFields": ["DishName"],
+                    "aggregateFields": ["DishAmountInt", "DishSumInt"]
+                }
+            },
+            headers=headers,
+            timeout=15
+        )
+        rows = r.json().get("data", [])
+        for row in rows:
+            total_revenue += row.get("DishSumInt", 0)
+            total_orders  += row.get("DishAmountInt", 0)
+            dishes.append({
+                "name": row.get("DishName", ""),
+                "qty":  row.get("DishAmountInt", 0),
+                "sum":  row.get("DishSumInt", 0)
+            })
+    except Exception as e:
+        logging.error(f"Syrve OLAP error: {e}")
+
+    # — Кассовые сессии —
+    cash_income = 0
+    card_income = 0
+    try:
+        r = requests.post(
+            f"{SYRVE_URL}/api/1/cash_shifts",
+            json={
+                "organizationIds": [org_id],
+                "openDateFrom": f"{today}T00:00:00",
+                "openDateTo":   f"{today}T23:59:59"
+            },
+            headers=headers,
+            timeout=15
+        )
+        shifts = r.json().get("cashShifts", [])
+        for shift in shifts:
+            cash_income += shift.get("cashIn", 0)
+            card_income += shift.get("cardIn", 0)
+    except Exception as e:
+        logging.error(f"Syrve cash_shifts error: {e}")
+
+    # — Формируем отчёт —
+    avg_check = round(total_revenue / total_orders, 2) if total_orders > 0 else 0
+    top5 = sorted(dishes, key=lambda x: x["sum"], reverse=True)[:5]
+
+    report  = f"🍽 <b>Puzzle Restaurant — Продажи</b>\n"
+    report += f"📅 {today}\n"
+    report += "━━━━━━━━━━━━━━━━\n"
+    report += f"💰 Выручка: <b>{total_revenue:.2f} AED</b>\n"
+    report += f"🧾 Чеков: <b>{total_orders}</b>\n"
+    report += f"📈 Средний чек: <b>{avg_check} AED</b>\n\n"
+    report += f"💵 Наличные: {cash_income:.2f} AED\n"
+    report += f"💳 Карта: {card_income:.2f} AED\n\n"
+
+    if top5:
+        report += "🏆 <b>Топ-5 блюд:</b>\n"
+        for i, d in enumerate(top5, 1):
+            report += f"{i}. {d['name']} — {d['qty']} шт / {d['sum']:.2f} AED\n"
+
+    return report
+
+# ─────────────────────────────────────────────
+# SERVICE INSPECTOR
+# ─────────────────────────────────────────────
 
 def get_si_token():
     try:
@@ -59,7 +192,6 @@ def get_si_report():
         if not audits:
             return "📋 <b>Service Inspector:</b> Проверок за сегодня нет"
 
-        # Группируем по шаблону + объект (убираем дубликаты, берём лучший результат)
         grouped = {}
         for a in audits:
             key = (a.get("name", ""), a.get("selectedInspectObjectName", ""))
@@ -67,27 +199,31 @@ def get_si_report():
             if not existing or a.get("result", 0) > existing.get("result", 0):
                 grouped[key] = a
 
-        report = "📋 <b>KPI — Service Inspector</b>\n"
+        report  = "📋 <b>KPI — Service Inspector</b>\n"
         report += f"📅 {datetime.now().strftime('%d.%m.%Y')}\n"
         report += "━━━━━━━━━━━━━━━━\n"
-        
+
         total = len(grouped)
-        avg = sum(a.get("result", 0) for a in grouped.values()) / total if total else 0
-        
+        avg   = sum(a.get("result", 0) for a in grouped.values()) / total if total else 0
+
         for (name, obj), a in sorted(grouped.items()):
-            result = a.get("result", 0)
+            result    = a.get("result", 0)
             inspector = a.get("inspectorName", "—")
-            closed = "✅" if a.get("isClosed") else "🔄"
-            emoji = "🟢" if result >= 80 else ("🟡" if result >= 60 else "🔴")
+            closed    = "✅" if a.get("isClosed") else "🔄"
+            emoji     = "🟢" if result >= 80 else ("🟡" if result >= 60 else "🔴")
             report += f"{closed} {emoji} <b>{name}</b>\n"
             report += f"   📍 {obj} | 👤 {inspector}\n"
             report += f"   📊 Результат: {result:.1f}%\n\n"
-        
+
         report += f"━━━━━━━━━━━━━━━━\n"
         report += f"📊 Проверок: {total} | Средний балл: {avg:.1f}%"
         return report
     except Exception as e:
         return f"❌ Ошибка SI: {str(e)}"
+
+# ─────────────────────────────────────────────
+# BITRIX24
+# ─────────────────────────────────────────────
 
 def get_bitrix_tasks():
     try:
@@ -107,24 +243,24 @@ def get_bitrix_tasks():
         done = r2.json().get("result", {}).get("tasks", [])
 
         active_by = {}
-        done_by = {}
+        done_by   = {}
         for t in tasks:
-            uid = str(t.get("responsibleId", ""))
+            uid  = str(t.get("responsibleId", ""))
             name = USERS.get(uid, f"ID {uid}")
             active_by.setdefault(name, []).append(t.get("title", ""))
         for t in done:
-            uid = str(t.get("responsibleId", ""))
+            uid  = str(t.get("responsibleId", ""))
             name = USERS.get(uid, f"ID {uid}")
             done_by.setdefault(name, []).append(t.get("title", ""))
 
-        report = "📌 <b>Задачи — Bitrix24</b>\n"
+        report  = "📌 <b>Задачи — Bitrix24</b>\n"
         report += "━━━━━━━━━━━━━━━━\n"
         all_names = set(list(active_by.keys()) + list(done_by.keys()))
         if not all_names:
             report += "✅ Нет активных задач\n"
         else:
             for name in sorted(all_names):
-                active = active_by.get(name, [])
+                active     = active_by.get(name, [])
                 done_count = len(done_by.get(name, []))
                 report += f"👤 <b>{name}</b>\n"
                 report += f"   ✅ Выполнено: {done_count} | 🔄 В работе: {len(active)}\n"
@@ -136,22 +272,30 @@ def get_bitrix_tasks():
     except Exception as e:
         return f"❌ Ошибка Bitrix: {str(e)}"
 
+# ─────────────────────────────────────────────
+# ОБЩИЙ ОТЧЁТ
+# ─────────────────────────────────────────────
+
 def get_full_report():
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    now    = datetime.now().strftime("%d.%m.%Y %H:%M")
     header = f"🍔 <b>TajBurger Dashboard</b>\n🕐 {now}\n\n"
-    tasks = get_bitrix_tasks()
-    si = get_si_report()
+    tasks  = get_bitrix_tasks()
+    si     = get_si_report()
     footer = "\n━━━━━━━━━━━━━━━━\n💡 /report — обновить отчёт"
     return header + tasks + "\n\n" + si + footer
+
+# ─────────────────────────────────────────────
+# WEBHOOK / ROUTES
+# ─────────────────────────────────────────────
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
     if not data:
         return jsonify({"ok": True})
-    message = data.get("message", {})
-    chat_id = message.get("chat", {}).get("id")
-    text = message.get("text", "")
+    message    = data.get("message", {})
+    chat_id    = message.get("chat", {}).get("id")
+    text       = message.get("text", "")
     first_name = message.get("from", {}).get("first_name", "")
     if not chat_id:
         return jsonify({"ok": True})
@@ -161,9 +305,10 @@ def webhook():
             f"👋 Привет, {first_name}!\n\n"
             f"🍔 <b>TajBurger Task Dashboard</b>\n\n"
             f"Команды:\n"
-            f"/report — полный отчёт\n"
+            f"/report — полный отчёт (TajBurger)\n"
             f"/tasks — только задачи Bitrix24\n"
             f"/kpi — только KPI Service Inspector\n"
+            f"/puzzle — продажи Puzzle Restaurant\n"
             f"/help — помощь")
     elif text == "/report":
         send_message(chat_id, "⏳ Загружаю данные...")
@@ -174,12 +319,16 @@ def webhook():
     elif text == "/kpi":
         send_message(chat_id, "⏳ Загружаю KPI...")
         send_message(chat_id, get_si_report())
+    elif text == "/puzzle":
+        send_message(chat_id, "⏳ Загружаю данные Puzzle Restaurant...")
+        send_message(chat_id, get_syrve_report())
     elif text == "/help":
         send_message(chat_id,
             "📋 <b>Команды:</b>\n\n"
-            "/report — полный дашборд\n"
+            "/report — полный дашборд TajBurger\n"
             "/tasks — задачи по сотрудникам\n"
             "/kpi — результаты проверок\n"
+            "/puzzle — продажи Puzzle Restaurant 🇦🇪\n"
             "/start — начало работы")
     else:
         send_message(chat_id, "Используй /report для получения отчёта 📊")
@@ -188,6 +337,11 @@ def webhook():
 @app.route("/send_report", methods=["GET"])
 def send_daily_report():
     send_message(OWNER_CHAT_ID, get_full_report())
+    return jsonify({"ok": True})
+
+@app.route("/send_puzzle_report", methods=["GET"])
+def send_puzzle_report():
+    send_message(OWNER_CHAT_ID, get_syrve_report())
     return jsonify({"ok": True})
 
 @app.route("/", methods=["GET"])
