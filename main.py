@@ -2,7 +2,7 @@ import os
 import logging
 import requests
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -13,7 +13,9 @@ OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID", "7674074787")
 SI_LOGIN = os.environ.get("SI_LOGIN")
 SI_PASSWORD = os.environ.get("SI_PASSWORD")
 SYRVE_URL = os.environ.get("SYRVE_URL", "https://puzzle-restaurant.syrve.app")
-SYRVE_API_KEY = os.environ.get("SYRVE_API_KEY")
+SYRVE_LOGIN = os.environ.get("SYRVE_LOGIN", "Gufron")
+SYRVE_PASSWORD = os.environ.get("SYRVE_PASSWORD")
+SYRVE_STORE_ID = int(os.environ.get("SYRVE_STORE_ID", "18023"))
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SI_API = "https://server.serviceinspector.ru/api/0"
@@ -39,126 +41,108 @@ def send_message(chat_id, text, parse_mode="HTML"):
 # SYRVE
 # ─────────────────────────────────────────────
 
+_syrve_token = None
+_syrve_token_expiry = None
+
 def syrve_get_token():
+    global _syrve_token, _syrve_token_expiry
+    if _syrve_token and _syrve_token_expiry and datetime.now() < _syrve_token_expiry:
+        return _syrve_token
     try:
         r = requests.post(
-            f"{SYRVE_URL}/api/1/access_token",
-            json={"apiLogin": SYRVE_API_KEY},
+            f"{SYRVE_URL}/api/auth/login",
+            json={"login": SYRVE_LOGIN, "password": SYRVE_PASSWORD},
             timeout=10
         )
         data = r.json()
         token = data.get("token")
-        if not token:
-            logging.error(f"Syrve token error: {data}")
-        return token
+        if token:
+            _syrve_token = token
+            _syrve_token_expiry = datetime.now() + timedelta(minutes=18)
+            logging.info("Syrve token obtained successfully")
+            return token
+        logging.error(f"Syrve login failed: {data}")
+        return None
     except Exception as e:
         logging.error(f"Syrve auth error: {e}")
         return None
 
-def syrve_get_org_id(token):
-    try:
-        r = requests.post(
-            f"{SYRVE_URL}/api/1/organizations",
-            json={"returnAdditionalInfo": False},
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10
-        )
-        orgs = r.json().get("organizations", [])
-        return orgs[0]["id"] if orgs else None
-    except Exception as e:
-        logging.error(f"Syrve org error: {e}")
-        return None
-
 def get_syrve_report(date=None):
-    if not SYRVE_API_KEY:
-        return "❌ Syrve: API ключ не настроен"
+    if not SYRVE_PASSWORD:
+        return "❌ Syrve: пароль не настроен (SYRVE_PASSWORD)"
 
     token = syrve_get_token()
     if not token:
         return "❌ Syrve: не удалось получить токен"
 
-    org_id = syrve_get_org_id(token)
-    if not org_id:
-        return "❌ Syrve: не удалось получить ID организации"
-
     today = date or datetime.now().strftime("%Y-%m-%d")
-    date_from = f"{today} 00:00:00"
-    date_to   = f"{today} 23:59:59"
-    headers   = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    dt = datetime.strptime(today, "%Y-%m-%d")
+    yesterday = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # — Продажи (OLAP) —
-    total_revenue = 0
-    total_orders  = 0
-    dishes = []
+    # Форматы дат для API
+    def fmt(d):
+        return datetime.strptime(d, "%Y-%m-%d").strftime("%a %b %d %Y")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
     try:
         r = requests.post(
-            f"{SYRVE_URL}/api/1/reports/olap",
+            f"{SYRVE_URL}/api/kpi/dashboard/data",
             json={
-                "organizationId": org_id,
-                "settings": {
-                    "queryFilter": {
-                        "dateFrom": date_from,
-                        "dateTo":   date_to,
-                        "openDateFrom": date_from,
-                        "openDateTo":   date_to
-                    },
-                    "groupByRowFields": ["DishName"],
-                    "aggregateFields": ["DishAmountInt", "DishSumInt"]
-                }
+                "dateFromCurrent": fmt(today),
+                "dateToCurrent": fmt(today),
+                "dateFromPrevious": fmt(yesterday),
+                "dateToPrevious": fmt(yesterday),
+                "storeIds": [SYRVE_STORE_ID],
+                "dashboardId": 0,
+                "dashboardType": "executive"
             },
             headers=headers,
-            timeout=15
+            timeout=20
         )
-        rows = r.json().get("data", [])
-        for row in rows:
-            total_revenue += row.get("DishSumInt", 0)
-            total_orders  += row.get("DishAmountInt", 0)
-            dishes.append({
-                "name": row.get("DishName", ""),
-                "qty":  row.get("DishAmountInt", 0),
-                "sum":  row.get("DishSumInt", 0)
-            })
+        data = r.json()
     except Exception as e:
-        logging.error(f"Syrve OLAP error: {e}")
+        logging.error(f"Syrve dashboard error: {e}")
+        return f"❌ Ошибка запроса Syrve: {str(e)}"
 
-    # — Кассовые сессии —
-    cash_income = 0
-    card_income = 0
-    try:
-        r = requests.post(
-            f"{SYRVE_URL}/api/1/cash_shifts",
-            json={
-                "organizationIds": [org_id],
-                "openDateFrom": f"{today}T00:00:00",
-                "openDateTo":   f"{today}T23:59:59"
-            },
-            headers=headers,
-            timeout=15
-        )
-        shifts = r.json().get("cashShifts", [])
-        for shift in shifts:
-            cash_income += shift.get("cashIn", 0)
-            card_income += shift.get("cardIn", 0)
-    except Exception as e:
-        logging.error(f"Syrve cash_shifts error: {e}")
-
-    # — Формируем отчёт —
-    avg_check = round(total_revenue / total_orders, 2) if total_orders > 0 else 0
-    top5 = sorted(dishes, key=lambda x: x["sum"], reverse=True)[:5]
-
-    report  = f"🍽 <b>Puzzle Restaurant — Продажи</b>\n"
+    # Парсим данные
+    report = f"🍽 <b>Puzzle Restaurant</b>\n"
     report += f"📅 {today}\n"
     report += "━━━━━━━━━━━━━━━━\n"
-    report += f"💰 Выручка: <b>{total_revenue:.2f} AED</b>\n"
-    report += f"🧾 Чеков: <b>{total_orders}</b>\n"
-    report += f"📈 Средний чек: <b>{avg_check} AED</b>\n\n"
-    report += f"💵 Наличные: {cash_income:.2f} AED\n"
-    report += f"💳 Карта: {card_income:.2f} AED\n\n"
 
-    if top5:
-        report += "🏆 <b>Топ-5 блюд:</b>\n"
-        for i, d in enumerate(top5, 1):
-            report += f"{i}. {d['name']} — {d['qty']} шт / {d['sum']:.2f} AED\n"
+    try:
+        rows = data.get("rows", [])
+        for row in rows:
+            title = row.get("title", "")
+            cells = row.get("cells", [])
+            for cell in cells:
+                widget_data = cell.get("widgetData", {})
+                metrics = widget_data.get("metrics", [])
+                for metric in metrics:
+                    code = metric.get("metricCode", "")
+                    current = metric.get("currentPeriodValue")
+                    if current is None:
+                        continue
+                    if code == "REV_NET":
+                        report += f"💰 <b>Выручка:</b> {current:.2f} AED\n"
+                    elif code == "ORDERS_COUNT":
+                        report += f"🧾 <b>Чеков:</b> {int(current)}\n"
+                    elif code == "AVG_CHECK":
+                        report += f"📈 <b>Средний чек:</b> {current:.2f} AED\n"
+                    elif code == "GUESTS_COUNT":
+                        report += f"👥 <b>Гостей:</b> {int(current)}\n"
+
+        if report.count('\n') <= 3:
+            report += f"\n<i>Данные за {today} ещё не поступили или день только начался</i>\n"
+            report += f"\n<pre>{str(data)[:300]}</pre>"
+
+    except Exception as e:
+        logging.error(f"Syrve parse error: {e}")
+        report += f"\n⚠️ Ошибка парсинга: {str(e)}\n"
+        report += f"<pre>{str(data)[:500]}</pre>"
 
     return report
 
@@ -281,7 +265,7 @@ def get_full_report():
     header = f"🍔 <b>TajBurger Dashboard</b>\n🕐 {now}\n\n"
     tasks  = get_bitrix_tasks()
     si     = get_si_report()
-    footer = "\n━━━━━━━━━━━━━━━━\n💡 /report — обновить отчёт"
+    footer = "\n━━━━━━━━━━━━━━━━\n💡 /report — обновить | /puzzle — Puzzle"
     return header + tasks + "\n\n" + si + footer
 
 # ─────────────────────────────────────────────
@@ -305,10 +289,10 @@ def webhook():
             f"👋 Привет, {first_name}!\n\n"
             f"🍔 <b>TajBurger Task Dashboard</b>\n\n"
             f"Команды:\n"
-            f"/report — полный отчёт (TajBurger)\n"
-            f"/tasks — только задачи Bitrix24\n"
-            f"/kpi — только KPI Service Inspector\n"
-            f"/puzzle — продажи Puzzle Restaurant\n"
+            f"/report — полный отчёт TajBurger\n"
+            f"/tasks — задачи Bitrix24\n"
+            f"/kpi — KPI Service Inspector\n"
+            f"/puzzle — продажи Puzzle Restaurant 🇦🇪\n"
             f"/help — помощь")
     elif text == "/report":
         send_message(chat_id, "⏳ Загружаю данные...")
