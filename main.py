@@ -147,15 +147,24 @@ def get_syrve_report(date=None):
                     val = m.get("currentPeriodValue") or m.get("value")
                     if code and val is not None:
                         metrics[code] = val
-                for s in (wd.get("series") or []):
-                    if not isinstance(s, dict):
-                        continue
-                    code = s.get("metricCode", "")
-                    vals = s.get("data") or []
-                    if code and vals:
-                        total = sum(v for v in vals if isinstance(v, (int, float)))
-                        if total:
-                            metrics.setdefault(code, total)
+                # series — словарь {metricCode: [values]}
+                series = wd.get("series") or {}
+                if isinstance(series, dict):
+                    for code, vals in series.items():
+                        if isinstance(vals, list) and vals:
+                            total = sum(v for v in vals if isinstance(v, (int, float)))
+                            if total:
+                                metrics.setdefault(code, total)
+                elif isinstance(series, list):
+                    for s in series:
+                        if not isinstance(s, dict):
+                            continue
+                        code = s.get("metricCode", "")
+                        vals = s.get("data") or []
+                        if code and vals:
+                            total = sum(v for v in vals if isinstance(v, (int, float)))
+                            if total:
+                                metrics.setdefault(code, total)
 
         rev    = metrics.get("REV_NET") or metrics.get("NET_REVENUE") or metrics.get("REVENUE")
         orders = metrics.get("ORDERS_COUNT") or metrics.get("CHECKS_COUNT")
