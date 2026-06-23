@@ -114,8 +114,16 @@ def get_syrve_report(date=None):
     report += "━━━━━━━━━━━━━━━━\n"
 
     try:
-        metrics = {}
+        logging.info(f"Syrve data keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
         rows = data.get("rows", []) if isinstance(data, dict) else []
+        logging.info(f"Syrve rows count: {len(rows)}")
+        if rows and isinstance(rows[0], dict):
+            cells = rows[0].get("cells", [])
+            if cells and isinstance(cells[0], dict):
+                wd = cells[0].get("widgetData", {})
+                logging.info(f"First widgetData keys: {list(wd.keys()) if isinstance(wd, dict) else type(wd)}")
+                logging.info(f"First widgetData: {str(wd)[:500]}")
+        metrics = {}
         for row in rows:
             if not isinstance(row, dict):
                 continue
