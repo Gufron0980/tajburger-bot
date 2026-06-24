@@ -7,18 +7,18 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-BITRIX_WEBHOOK = os.environ.get("BITRIX_WEBHOOK")
-OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID", "7674074787")
-SI_LOGIN = os.environ.get("SI_LOGIN")
-SI_PASSWORD = os.environ.get("SI_PASSWORD")
-SYRVE_URL = os.environ.get("SYRVE_URL", "https://puzzle-restaurant.syrve.app")
-SYRVE_LOGIN = os.environ.get("SYRVE_LOGIN", "Gufron")
-SYRVE_PASSWORD = os.environ.get("SYRVE_PASSWORD")
-SYRVE_STORE_ID = int(os.environ.get("SYRVE_STORE_ID", "18023"))
+BOT_TOKEN        = os.environ.get("BOT_TOKEN")
+BITRIX_WEBHOOK   = os.environ.get("BITRIX_WEBHOOK")
+OWNER_CHAT_ID    = os.environ.get("OWNER_CHAT_ID", "7674074787")
+SI_LOGIN         = os.environ.get("SI_LOGIN")
+SI_PASSWORD      = os.environ.get("SI_PASSWORD")
+SYRVE_URL        = os.environ.get("SYRVE_URL", "https://puzzle-restaurant.syrve.app")
+SYRVE_LOGIN      = os.environ.get("SYRVE_LOGIN", "Gufron")
+SYRVE_PASSWORD   = os.environ.get("SYRVE_PASSWORD")
+SYRVE_STORE_ID   = int(os.environ.get("SYRVE_STORE_ID", "18023"))
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-SI_API = "https://server.serviceinspector.ru/api/0"
+SI_API       = "https://server.serviceinspector.ru/api/0"
 
 USERS = {
     "1": "Гуфрон Рустамов", "7": "Хабиб Кенджабаев",
@@ -29,6 +29,10 @@ USERS = {
     "7735": "Аъзамчон Точибоев", "8621": "Шерафкан Азиззода",
 }
 
+# ─────────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────────
+
 def send_message(chat_id, text, parse_mode="HTML"):
     url = f"{TELEGRAM_API}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
@@ -38,10 +42,10 @@ def send_message(chat_id, text, parse_mode="HTML"):
         logging.error(f"Send message error: {e}")
 
 # ─────────────────────────────────────────────
-# SYRVE
+# SYRVE AUTH
 # ─────────────────────────────────────────────
 
-_syrve_token = None
+_syrve_token        = None
 _syrve_token_expiry = None
 
 def syrve_get_token():
@@ -57,7 +61,7 @@ def syrve_get_token():
         data = r.json()
         token = data.get("token")
         if token:
-            _syrve_token = token
+            _syrve_token        = token
             _syrve_token_expiry = datetime.now() + timedelta(minutes=18)
             logging.info("Syrve token obtained successfully")
             return token
@@ -67,128 +71,291 @@ def syrve_get_token():
         logging.error(f"Syrve auth error: {e}")
         return None
 
-def get_syrve_report(date=None):
-    if not SYRVE_PASSWORD:
-        return "❌ Syrve: пароль не настроен (SYRVE_PASSWORD)"
-
+def syrve_headers():
     token = syrve_get_token()
     if not token:
+        return None
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+def fmt_date(d):
+    """datetime → 'Mon Jun 23 2026'"""
+    return d.strftime("%a %b %d %Y")
+
+def parse_series(data):
+    """Извлекаем метрики из widgetData.series (dict или list)"""
+    metrics = {}
+    rows = data.get("rows", []) if isinstance(data, dict) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for cell in row.get("cells", []):
+            if not isinstance(cell, dict):
+                continue
+            wd = cell.get("widgetData", {})
+            if not isinstance(wd, dict):
+                continue
+            series = wd.get("series", {})
+            if isinstance(series, dict):
+                for code, vals in series.items():
+                    if isinstance(vals, list) and vals:
+                        total = sum(v for v in vals if isinstance(v, (int, float)))
+                        metrics.setdefault(code, 0)
+                        metrics[code] += total
+            for tile in (wd.get("tiles") or []):
+                if not isinstance(tile, dict):
+                    continue
+                code = tile.get("metricCode", "")
+                val  = tile.get("currentPeriodValue") or tile.get("value")
+                if code and val is not None:
+                    metrics[code] = val
+    return metrics
+
+# ─────────────────────────────────────────────
+# SYRVE: КОММЕРЧЕСКИЙ ОТЧЁТ (/puzzle)
+# ─────────────────────────────────────────────
+
+def get_syrve_commercial(date=None):
+    if not SYRVE_PASSWORD:
+        return "❌ Syrve: пароль не настроен"
+
+    hdrs = syrve_headers()
+    if not hdrs:
         return "❌ Syrve: не удалось получить токен"
 
-    today = date or datetime.now().strftime("%Y-%m-%d")
-    dt = datetime.strptime(today, "%Y-%m-%d")
+    today     = date or datetime.now().strftime("%Y-%m-%d")
+    dt        = datetime.strptime(today, "%Y-%m-%d")
     yesterday = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # Форматы дат для API
-    def fmt(d):
-        return datetime.strptime(d, "%Y-%m-%d").strftime("%a %b %d %Y")
+    report  = f"🍽 <b>Puzzle Restaurant — Коммерция</b>\n"
+    report += f"📅 {today}\n"
+    report += "━━━━━━━━━━━━━━━━\n"
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-
+    # 1. Executive dashboard (выручка, средний чек)
     try:
         r = requests.post(
             f"{SYRVE_URL}/api/kpi/dashboard/data",
             json={
-                "dateFromCurrent": fmt(today),
-                "dateToCurrent": fmt(today),
-                "dateFromPrevious": fmt(yesterday),
-                "dateToPrevious": fmt(yesterday),
-                "storeIds": [SYRVE_STORE_ID],
-                "dashboardId": 0,
-                "dashboardType": "executive"
+                "dateFromCurrent":  fmt_date(dt),
+                "dateToCurrent":    fmt_date(dt),
+                "dateFromPrevious": fmt_date(dt - timedelta(days=1)),
+                "dateToPrevious":   fmt_date(dt - timedelta(days=1)),
+                "storeIds":         [SYRVE_STORE_ID],
+                "dashboardId":      0,
+                "dashboardType":    "executive"
             },
-            headers=headers,
-            timeout=20
+            headers=hdrs, timeout=20
         )
-        data = r.json()
-    except Exception as e:
-        logging.error(f"Syrve dashboard error: {e}")
-        return f"❌ Ошибка запроса Syrve: {str(e)}"
+        metrics = parse_series(r.json())
+        rev     = metrics.get("REV_NET") or metrics.get("REVENUE")
+        avg     = metrics.get("AVG_CHECK")
+        orders  = metrics.get("ORDERS_COUNT") or metrics.get("CHECKS_COUNT")
+        guests  = metrics.get("GUESTS_COUNT")
 
-    # Парсим данные
-    report = f"🍽 <b>Puzzle Restaurant</b>\n"
+        if rev:
+            report += f"💰 <b>Выручка:</b> {float(rev):.2f} AED\n"
+        if orders:
+            report += f"🧾 <b>Чеков:</b> {int(float(orders))}\n"
+        if avg:
+            report += f"📈 <b>Средний чек:</b> {float(avg):.2f} AED\n"
+        if guests:
+            report += f"👥 <b>Гостей:</b> {int(float(guests))}\n"
+    except Exception as e:
+        report += f"⚠️ Выручка: {e}\n"
+
+    # 2. P&L (себестоимость, валовая прибыль)
+    try:
+        r = requests.post(
+            f"{SYRVE_URL}/api/kpi/dashboard/data",
+            json={
+                "dateFromCurrent":  fmt_date(dt),
+                "dateToCurrent":    fmt_date(dt),
+                "dateFromPrevious": fmt_date(dt - timedelta(days=1)),
+                "dateToPrevious":   fmt_date(dt - timedelta(days=1)),
+                "storeIds":         [SYRVE_STORE_ID],
+                "dashboardId":      "281546",
+                "dashboardType":    "executive"
+            },
+            headers=hdrs, timeout=20
+        )
+        pl = parse_series(r.json())
+        cost  = pl.get("COST_PRICE") or pl.get("COST")
+        gross = pl.get("GROSS_PROFIT") or pl.get("GROSS")
+        disc  = pl.get("DISCOUNT") or pl.get("DISCOUNTS_SUM")
+
+        report += "\n<b>📊 P&L:</b>\n"
+        if cost:
+            report += f"🏭 Себестоимость: {float(cost):.2f} AED\n"
+        if gross:
+            report += f"📈 Валовая прибыль: {float(gross):.2f} AED\n"
+        if disc:
+            report += f"🏷 Скидки: {float(disc):.2f} AED\n"
+    except Exception as e:
+        logging.error(f"P&L error: {e}")
+
+    # 3. Топ-3 блюда
+    try:
+        r = requests.post(
+            f"{SYRVE_URL}/api/report/product-mix",
+            json={
+                "dateFrom": fmt_date(dt),
+                "dateTo":   fmt_date(dt),
+                "mode":     "TOTAL_BY_PERIODS",
+                "storeIds": [SYRVE_STORE_ID]
+            },
+            headers=hdrs, timeout=20
+        )
+        pm_data = r.json()
+        products = []
+        if isinstance(pm_data, dict):
+            for item in (pm_data.get("items") or pm_data.get("products") or pm_data.get("data") or []):
+                if isinstance(item, dict):
+                    name = item.get("name") or item.get("productName") or item.get("dish")
+                    qty  = item.get("quantity") or item.get("count") or item.get("sold") or 0
+                    summ = item.get("sum") or item.get("revenue") or item.get("amount") or 0
+                    if name:
+                        products.append({"name": name, "qty": float(qty), "sum": float(summ)})
+        elif isinstance(pm_data, list):
+            for item in pm_data:
+                if isinstance(item, dict):
+                    name = item.get("name") or item.get("productName")
+                    qty  = item.get("quantity") or item.get("count") or 0
+                    summ = item.get("sum") or item.get("revenue") or 0
+                    if name:
+                        products.append({"name": name, "qty": float(qty), "sum": float(summ)})
+
+        if products:
+            top3 = sorted(products, key=lambda x: x["sum"], reverse=True)[:3]
+            report += "\n🏆 <b>Топ-3 блюда:</b>\n"
+            for i, p in enumerate(top3, 1):
+                report += f"{i}. {p['name']} — {int(p['qty'])} шт / {p['sum']:.2f} AED\n"
+        else:
+            logging.info(f"Product-mix raw: {str(pm_data)[:300]}")
+    except Exception as e:
+        logging.error(f"Product-mix error: {e}")
+
+    return report
+
+# ─────────────────────────────────────────────
+# SYRVE: БУХГАЛТЕРСКИЙ ОТЧЁТ (/puzzle_fin)
+# ─────────────────────────────────────────────
+
+def get_syrve_finance(date=None):
+    if not SYRVE_PASSWORD:
+        return "❌ Syrve: пароль не настроен"
+
+    hdrs = syrve_headers()
+    if not hdrs:
+        return "❌ Syrve: не удалось получить токен"
+
+    today = date or datetime.now().strftime("%Y-%m-%d")
+    dt    = datetime.strptime(today, "%Y-%m-%d")
+
+    # Даты в формате для documents API
+    date_from = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    date_to   = today
+
+    report  = f"📒 <b>Puzzle Restaurant — Бухгалтерия</b>\n"
     report += f"📅 {today}\n"
     report += "━━━━━━━━━━━━━━━━\n"
 
+    # 1. Кассовые смены
     try:
-        logging.info(f"Syrve data keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-        rows = data.get("rows", []) if isinstance(data, dict) else []
-        logging.info(f"Syrve rows count: {len(rows)}")
-        if rows and isinstance(rows[0], dict):
-            cells = rows[0].get("cells", [])
-            if cells and isinstance(cells[0], dict):
-                wd = cells[0].get("widgetData", {})
-                logging.info(f"First widgetData keys: {list(wd.keys()) if isinstance(wd, dict) else type(wd)}")
-                logging.info(f"First widgetData: {str(wd)[:500]}")
-        metrics = {}
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            for cell in row.get("cells", []):
-                if not isinstance(cell, dict):
-                    continue
-                wd = cell.get("widgetData", {})
-                if not isinstance(wd, dict):
-                    continue
-                for tile in (wd.get("tiles") or []):
-                    if not isinstance(tile, dict):
-                        continue
-                    code = tile.get("metricCode", "")
-                    val = tile.get("currentPeriodValue") or tile.get("value")
-                    if code and val is not None:
-                        metrics[code] = val
-                for m in (wd.get("metrics") or []):
-                    if not isinstance(m, dict):
-                        continue
-                    code = m.get("metricCode", "")
-                    val = m.get("currentPeriodValue") or m.get("value")
-                    if code and val is not None:
-                        metrics[code] = val
-                # series — словарь {metricCode: [values]}
-                series = wd.get("series") or {}
-                if isinstance(series, dict):
-                    for code, vals in series.items():
-                        if isinstance(vals, list) and vals:
-                            total = sum(v for v in vals if isinstance(v, (int, float)))
-                            if total:
-                                metrics.setdefault(code, total)
-                elif isinstance(series, list):
-                    for s in series:
-                        if not isinstance(s, dict):
-                            continue
-                        code = s.get("metricCode", "")
-                        vals = s.get("data") or []
-                        if code and vals:
-                            total = sum(v for v in vals if isinstance(v, (int, float)))
-                            if total:
-                                metrics.setdefault(code, total)
+        r = requests.get(
+            f"{SYRVE_URL}/api/cash/eod/status",
+            headers=hdrs, timeout=10
+        )
+        eod = r.json()
+        if isinstance(eod, dict):
+            status  = eod.get("status", "—")
+            closed  = eod.get("closedAt") or eod.get("closeDate") or "—"
+            by_whom = eod.get("closedBy") or eod.get("user") or "—"
+            report += f"🏦 <b>Закрытие дня:</b> {status}\n"
+            if closed != "—":
+                report += f"   🕐 Закрыто: {closed}\n"
+            if by_whom != "—":
+                report += f"   👤 Кем: {by_whom}\n"
+        elif isinstance(eod, list) and eod:
+            report += f"🏦 <b>Кассовых смен закрыто:</b> {len(eod)}\n"
+            total_cash = sum(float(s.get("cashRevenue", 0) or 0) for s in eod if isinstance(s, dict))
+            total_card = sum(float(s.get("cardRevenue", 0) or 0) for s in eod if isinstance(s, dict))
+            if total_cash or total_card:
+                report += f"   💵 Наличные: {total_cash:.2f} AED\n"
+                report += f"   💳 Карта: {total_card:.2f} AED\n"
+                report += f"   💰 Итого: {total_cash + total_card:.2f} AED\n"
+    except Exception as e:
+        report += f"⚠️ Смены: {e}\n"
 
-        rev    = metrics.get("REV_NET") or metrics.get("NET_REVENUE") or metrics.get("REVENUE")
-        orders = metrics.get("ORDERS_COUNT") or metrics.get("CHECKS_COUNT")
-        avg    = metrics.get("AVG_CHECK") or metrics.get("AVG_REVENUE")
-        guests = metrics.get("GUESTS_COUNT")
+    # 2. Активные смены
+    try:
+        r = requests.get(
+            f"{SYRVE_URL}/api/cash/shift/active",
+            headers=hdrs, timeout=10
+        )
+        shifts = r.json()
+        if isinstance(shifts, list):
+            report += f"\n💵 <b>Активных смен:</b> {len(shifts)}\n"
+            for s in shifts[:3]:
+                if isinstance(s, dict):
+                    num  = s.get("number") or s.get("id", "—")
+                    cash = float(s.get("cashRevenue", 0) or 0)
+                    card = float(s.get("cardRevenue", 0) or 0)
+                    report += f"   Смена #{num}: 💵{cash:.0f} + 💳{card:.0f} AED\n"
+        elif isinstance(shifts, dict):
+            cash = float(shifts.get("cashRevenue", 0) or 0)
+            card = float(shifts.get("cardRevenue", 0) or 0)
+            report += f"\n💵 <b>Текущая смена:</b> {cash:.2f} + {card:.2f} AED\n"
+    except Exception as e:
+        report += f"⚠️ Активные смены: {e}\n"
 
-        if any(v is not None for v in [rev, orders, avg, guests]):
-            if rev is not None:
-                report += f"💰 <b>Выручка:</b> {float(rev):.2f} AED\n"
-            if orders is not None:
-                report += f"🧾 <b>Чеков:</b> {int(float(orders))}\n"
-            if avg is not None:
-                report += f"📈 <b>Средний чек:</b> {float(avg):.2f} AED\n"
-            if guests is not None:
-                report += f"👥 <b>Гостей:</b> {int(float(guests))}\n"
+    # 3. Документы (приходные накладные, акты приготовления)
+    try:
+        r = requests.get(
+            f"{SYRVE_URL}/api/documents/list",
+            params={"dateFrom": date_from, "dateTo": date_to, "store": SYRVE_STORE_ID},
+            headers=hdrs, timeout=15
+        )
+        docs = r.json()
+        doc_list = docs if isinstance(docs, list) else (docs.get("items") or docs.get("documents") or [])
+
+        # Фильтруем по типам
+        incoming    = [d for d in doc_list if isinstance(d, dict) and "накладная" in str(d.get("type", "")).lower() or "INCOMING" in str(d.get("type", "")).upper() or "IncomingInvoice" in str(d.get("documentType", ""))]
+        production  = [d for d in doc_list if isinstance(d, dict) and ("приготовл" in str(d.get("type", "")).lower() or "ProductionDocument" in str(d.get("documentType", "")) or "приготов" in str(d.get("typeName", "")).lower())]
+        all_types   = {}
+        for d in doc_list:
+            if isinstance(d, dict):
+                t = d.get("type") or d.get("documentType") or d.get("typeName") or "Unknown"
+                all_types[t] = all_types.get(t, 0) + 1
+
+        report += f"\n📄 <b>Документы за {date_from} — {date_to}:</b>\n"
+        if all_types:
+            for t, cnt in sorted(all_types.items(), key=lambda x: -x[1])[:6]:
+                report += f"   • {t}: {cnt} шт\n"
         else:
-            report += f"<i>Данные за {today} ещё не поступили</i>\n"
-            if metrics:
-                report += f"<i>Метрики: {', '.join(list(metrics.keys())[:5])}</i>\n"
-            logging.info(f"Syrve metrics: {metrics}")
+            report += "   Нет документов\n"
 
     except Exception as e:
-        logging.error(f"Syrve parse error: {e}")
-        report += f"\n⚠️ Ошибка парсинга: {str(e)}\n"
+        report += f"⚠️ Документы: {e}\n"
+
+    # 4. Инвентаризация
+    try:
+        r = requests.get(
+            f"{SYRVE_URL}/api/inventory/count/list/active",
+            headers=hdrs, timeout=10
+        )
+        inv = r.json()
+        inv_list = inv if isinstance(inv, list) else (inv.get("items") or [])
+        report += f"\n📦 <b>Инвентаризация:</b>\n"
+        if inv_list:
+            report += f"   Активных заданий: {len(inv_list)}\n"
+            for item in inv_list[:3]:
+                if isinstance(item, dict):
+                    name   = item.get("name") or item.get("storeName") or "—"
+                    status = item.get("status") or item.get("state") or "—"
+                    report += f"   • {name}: {status}\n"
+        else:
+            report += "   Активных заданий нет\n"
+    except Exception as e:
+        report += f"⚠️ Инвентаризация: {e}\n"
 
     return report
 
@@ -214,39 +381,50 @@ def get_si_report():
     today = datetime.now().strftime("%d.%m.%Y")
     try:
         r = requests.get(f"{SI_API}/inspector/get_processed_audits",
-            params={
-                "access_token": token, "org_id": org_id,
-                "from_date": today, "to_date": today
-            }, timeout=15)
+            params={"access_token": token, "org_id": org_id,
+                    "from_date": today, "to_date": today}, timeout=15)
         audits = r.json()
         if not audits:
             return "📋 <b>Service Inspector:</b> Проверок за сегодня нет"
 
-        grouped = {}
+        # Группируем по сотруднику
+        by_employee = {}
         for a in audits:
-            key = (a.get("name", ""), a.get("selectedInspectObjectName", ""))
-            existing = grouped.get(key)
-            if not existing or a.get("result", 0) > existing.get("result", 0):
-                grouped[key] = a
+            emp  = a.get("inspectorName", "—")
+            name = a.get("name", "")
+            obj  = a.get("selectedInspectObjectName", "")
+            res  = a.get("result", 0)
+            key  = (emp, name, obj)
+            existing = by_employee.get(key)
+            if not existing or res > existing.get("result", 0):
+                by_employee[key] = a
 
         report  = "📋 <b>KPI — Service Inspector</b>\n"
-        report += f"📅 {datetime.now().strftime('%d.%m.%Y')}\n"
+        report += f"📅 {today}\n"
         report += "━━━━━━━━━━━━━━━━\n"
 
-        total = len(grouped)
-        avg   = sum(a.get("result", 0) for a in grouped.values()) / total if total else 0
+        # Группируем по сотруднику для сводки
+        emp_stats = {}
+        for (emp, name, obj), a in by_employee.items():
+            if emp not in emp_stats:
+                emp_stats[emp] = {"results": [], "checklists": []}
+            emp_stats[emp]["results"].append(a.get("result", 0))
+            emp_stats[emp]["checklists"].append(name)
 
-        for (name, obj), a in sorted(grouped.items()):
-            result    = a.get("result", 0)
-            inspector = a.get("inspectorName", "—")
-            closed    = "✅" if a.get("isClosed") else "🔄"
-            emoji     = "🟢" if result >= 80 else ("🟡" if result >= 60 else "🔴")
-            report += f"{closed} {emoji} <b>{name}</b>\n"
-            report += f"   📍 {obj} | 👤 {inspector}\n"
-            report += f"   📊 Результат: {result:.1f}%\n\n"
+        for emp, stats in sorted(emp_stats.items()):
+            avg = sum(stats["results"]) / len(stats["results"]) if stats["results"] else 0
+            cnt = len(stats["results"])
+            emoji = "🟢" if avg >= 80 else ("🟡" if avg >= 60 else "🔴")
+            report += f"{emoji} <b>{emp}</b>\n"
+            report += f"   📊 Выполнение: {avg:.1f}% | Чек-листов: {cnt}\n"
+            for cl in stats["checklists"][:2]:
+                report += f"   • {cl}\n"
+            report += "\n"
 
+        total = len(by_employee)
+        avg_all = sum(a.get("result", 0) for a in by_employee.values()) / total if total else 0
         report += f"━━━━━━━━━━━━━━━━\n"
-        report += f"📊 Проверок: {total} | Средний балл: {avg:.1f}%"
+        report += f"📊 Проверок: {total} | Средний балл: {avg_all:.1f}%"
         return report
     except Exception as e:
         return f"❌ Ошибка SI: {str(e)}"
@@ -311,7 +489,7 @@ def get_full_report():
     header = f"🍔 <b>TajBurger Dashboard</b>\n🕐 {now}\n\n"
     tasks  = get_bitrix_tasks()
     si     = get_si_report()
-    footer = "\n━━━━━━━━━━━━━━━━\n💡 /report — обновить | /puzzle — Puzzle"
+    footer = "\n━━━━━━━━━━━━━━━━\n💡 /puzzle — Puzzle | /puzzle_fin — Бухгалтерия"
     return header + tasks + "\n\n" + si + footer
 
 # ─────────────────────────────────────────────
@@ -335,10 +513,11 @@ def webhook():
             f"👋 Привет, {first_name}!\n\n"
             f"🍔 <b>TajBurger Task Dashboard</b>\n\n"
             f"Команды:\n"
-            f"/report — полный отчёт TajBurger\n"
+            f"/report — дашборд TajBurger\n"
             f"/tasks — задачи Bitrix24\n"
             f"/kpi — KPI Service Inspector\n"
-            f"/puzzle — продажи Puzzle Restaurant 🇦🇪\n"
+            f"/puzzle — 🇦🇪 Коммерция Puzzle\n"
+            f"/puzzle_fin — 🇦🇪 Бухгалтерия Puzzle\n"
             f"/help — помощь")
     elif text == "/report":
         send_message(chat_id, "⏳ Загружаю данные...")
@@ -350,15 +529,19 @@ def webhook():
         send_message(chat_id, "⏳ Загружаю KPI...")
         send_message(chat_id, get_si_report())
     elif text == "/puzzle":
-        send_message(chat_id, "⏳ Загружаю данные Puzzle Restaurant...")
-        send_message(chat_id, get_syrve_report())
+        send_message(chat_id, "⏳ Загружаю коммерцию Puzzle Restaurant...")
+        send_message(chat_id, get_syrve_commercial())
+    elif text == "/puzzle_fin":
+        send_message(chat_id, "⏳ Загружаю бухгалтерию Puzzle Restaurant...")
+        send_message(chat_id, get_syrve_finance())
     elif text == "/help":
         send_message(chat_id,
             "📋 <b>Команды:</b>\n\n"
             "/report — полный дашборд TajBurger\n"
             "/tasks — задачи по сотрудникам\n"
             "/kpi — результаты проверок\n"
-            "/puzzle — продажи Puzzle Restaurant 🇦🇪\n"
+            "/puzzle — коммерция Puzzle 🇦🇪\n"
+            "/puzzle_fin — бухгалтерия Puzzle 🇦🇪\n"
             "/start — начало работы")
     else:
         send_message(chat_id, "Используй /report для получения отчёта 📊")
@@ -371,7 +554,12 @@ def send_daily_report():
 
 @app.route("/send_puzzle_report", methods=["GET"])
 def send_puzzle_report():
-    send_message(OWNER_CHAT_ID, get_syrve_report())
+    send_message(OWNER_CHAT_ID, get_syrve_commercial())
+    return jsonify({"ok": True})
+
+@app.route("/send_puzzle_fin", methods=["GET"])
+def send_puzzle_fin():
+    send_message(OWNER_CHAT_ID, get_syrve_finance())
     return jsonify({"ok": True})
 
 @app.route("/", methods=["GET"])
